@@ -8447,6 +8447,16 @@
     githubId = 99674037;
     name = "Qiming Chu";
   };
+  elxreno = {
+    email = "elxreno@gmail.com";
+    github = "ElXreno";
+    githubId = 40758597;
+    name = "Michael";
+    keys = [{
+      longkeyid = "ed25519/0x635CDB7EE37B4706";
+      fingerprint = "23A6 11B2 FC21 B60D ACA4  0149 635C DB7E E37B 4706";
+    }];
+  };
   emmabastas = {
     email = "emma.bastas@protonmail.com";
     matrix = "@emmabastas:matrix.org";
