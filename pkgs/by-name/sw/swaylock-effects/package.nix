@@ -25,12 +25,8 @@ stdenv.mkDerivation rec {
     sha256 = "sha256-cuFM+cbUmGfI1EZu7zOsQUj4rA4Uc4nUXcvIfttf9zE=";
   };
 
-  postPatch = ''
-    sed -iE "s/version: '1\.3',/version: '${version}',/" meson.build
-  '';
-
   strictDeps = true;
-  nativeBuildInputs = [ meson ninja pkg-config scdoc wayland-scanner];
+  nativeBuildInputs = [ meson ninja pkg-config scdoc wayland-scanner ];
   buildInputs = [ wayland wayland-protocols libxkbcommon cairo gdk-pixbuf pam ];
 
   mesonFlags = [
