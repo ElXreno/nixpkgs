@@ -35160,6 +35160,8 @@ with pkgs;
 
   upnp-router-control = callPackage ../applications/networking/upnp-router-control { };
 
+  upscaler = callPackage ../applications/graphics/upscaler { };
+
   urh = callPackage ../applications/radio/urh { };
 
   uroboros = callPackage ../tools/system/uroboros { };
