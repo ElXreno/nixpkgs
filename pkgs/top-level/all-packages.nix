@@ -36293,6 +36293,8 @@ with pkgs;
 
   xchm = callPackage ../applications/misc/xchm { };
 
+  xclicker = callPackage ../tools/X11/xclicker { };
+
   inherit (xorg) xcompmgr;
 
   x-create-mouse-void = callPackage ../applications/window-managers/x-create-mouse-void { };
