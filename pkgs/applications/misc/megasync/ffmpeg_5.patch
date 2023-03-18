@@ -1,0 +1,23 @@
+From 678f182db9ef0121baf06a2945094b89413ae562 Mon Sep 17 00:00:00 2001
+From: Vasiliy Glazov <vascom2@gmail.com>
+Date: Mon, 4 Apr 2022 12:00:04 +0300
+Subject: [PATCH] Fix build with FFMPEG 5
+
+This change allow to build with FFMPEG 5.0.
+---
+ src/gfx/freeimage.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/MEGASync/mega/src/gfx/freeimage.cpp b/src/MEGASync/mega/src/gfx/freeimage.cpp
+index be173abea2..63a8c080e6 100644
+--- a/src/MEGASync/mega/src/gfx/freeimage.cpp
++++ b/src/MEGASync/mega/src/gfx/freeimage.cpp
+@@ -285,7 +285,7 @@ bool GfxProcFreeImage::readbitmapFfmpeg(FileAccess* fa, const LocalPath& imagePa
+ 
+     // Find decoder for video stream
+     AVCodecID codecId = codecParm->codec_id;
+-    AVCodec* decoder = avcodec_find_decoder(codecId);
++    auto decoder = avcodec_find_decoder(codecId);
+     if (!decoder)
+     {
+         LOG_warn << "Codec not found: " << codecId;
