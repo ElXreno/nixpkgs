@@ -7,7 +7,6 @@
 , curl
 , doxygen
 , fetchFromGitHub
-, fetchpatch
 , ffmpeg
 , freeimage
 , libmediainfo
@@ -74,8 +73,6 @@ mkDerivation rec {
     # megasync target is not part of the install rule thanks to a commented block
     ./install-megasync.patch
     ./ffmpeg_44.patch
-    # Fix build with FFMPEG 5
-    ./ffmpeg_5.patch
   ];
 
   postPatch = ''
