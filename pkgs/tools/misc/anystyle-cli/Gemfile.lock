@@ -71,7 +71,7 @@ GEM
     unicode-scripts (1.6.0)
     wapiti (1.0.7)
       builder (~> 3.2)
-    yard (0.9.25)
+    yard (0.9.36)
     zeitwerk (2.4.0)
 
 PLATFORMS
