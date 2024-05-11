@@ -8,7 +8,6 @@
 , doxygen
 , fetchFromGitHub
 , ffmpeg
-, freeimage
 , libmediainfo
 , libraw
 , libsodium
@@ -54,7 +53,6 @@ mkDerivation rec {
     cryptopp
     curl
     ffmpeg
-    freeimage
     libmediainfo
     libraw
     libsodium
@@ -97,7 +95,7 @@ mkDerivation rec {
     "--with-cryptopp"
     "--with-curl"
     "--with-ffmpeg"
-    "--with-freeimage"
+    "--without-freeimage"
     "--without-readline"
     "--without-termcap"
     "--with-sodium"
