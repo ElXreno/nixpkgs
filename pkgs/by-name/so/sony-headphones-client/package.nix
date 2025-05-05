@@ -2,7 +2,6 @@
   lib,
   stdenv,
   fetchFromGitHub,
-  fetchpatch,
   cmake,
   pkg-config,
   bluez,
@@ -16,25 +15,15 @@
 
 stdenv.mkDerivation (finalAttrs: {
   pname = "SonyHeadphonesClient";
-  version = "1.3.2";
+  version = "1.3.13";
 
   src = fetchFromGitHub {
-    owner = "Plutoberth";
+    owner = "mos9527";
     repo = "SonyHeadphonesClient";
-    tag = "v${finalAttrs.version}";
-    hash = "sha256-vhI97KheKzr87exCh4xNN7NDefcagdMu1tWSt67vLiU=";
+    rev = finalAttrs.version;
+    hash = "sha256-RrBQ628ycJSR1PWmWxRz6yTc9ZTsmhkFgsRH06tiKKo=";
     fetchSubmodules = true;
   };
-
-  patches = [
-    (fetchpatch {
-      name = "include-cstdint-to-fix-gcc-compiling.patch";
-      url = "https://github.com/Plutoberth/SonyHeadphonesClient/commit/4da8a12b22f8a45e79aa53d4cae88ca99b51d41f.patch";
-      stripLen = 2;
-      extraPrefix = "";
-      hash = "sha256-IZR/Znj40pUEC9gmNJDMPWuZOM2ueAgykZFn5DVn6es=";
-    })
-  ];
 
   nativeBuildInputs = [
     cmake
@@ -52,14 +41,6 @@ stdenv.mkDerivation (finalAttrs: {
   sourceRoot = "${finalAttrs.src.name}/Client";
 
   cmakeFlags = [ "-Wno-dev" ];
-
-  postPatch = ''
-    substituteInPlace Constants.h \
-      --replace "UNKNOWN = -1" "// UNKNOWN removed since it doesn't fit in char"
-
-    substituteInPlace CMakeLists.txt \
-      --replace-fail "cmake_minimum_required(VERSION 3.1 FATAL_ERROR)" "cmake_minimum_required(VERSION 3.10)"
-  '';
 
   installPhase = ''
     runHook preInstall
