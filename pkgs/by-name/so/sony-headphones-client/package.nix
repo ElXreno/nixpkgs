@@ -9,7 +9,9 @@
   glew,
   glfw,
   imgui,
-  xorg,
+  libx11,
+  libxinerama,
+  libxi,
   libxcursor,
   libxrandr,
   makeDesktopItem,
@@ -18,19 +20,15 @@
 
 stdenv.mkDerivation (finalAttrs: {
   pname = "SonyHeadphonesClient";
-  version = "1.4.3";
+  version = "1.4.4";
 
   src = fetchFromGitHub {
     owner = "mos9527";
     repo = "SonyHeadphonesClient";
     rev = finalAttrs.version;
-    hash = "sha256-3DHMqcM5sCNK7vCa3zMmIUF3WcHB+csc+xKSVsorTno=";
+    hash = "sha256-ACUY9xlBH9d7l/JBsOMVaMom5jxnjvWw/HfHB75d+TU=";
     fetchSubmodules = true;
   };
-
-  patches = [
-    ./0001-Fix-building-with-Werror-format-security.patch
-  ];
 
   nativeBuildInputs = [
     cmake
@@ -43,9 +41,9 @@ stdenv.mkDerivation (finalAttrs: {
     glew
     glfw
     imgui
-    xorg.libX11
-    xorg.libXinerama
-    xorg.libXi
+    libx11
+    libxinerama
+    libxi
     libxcursor
     libxrandr
   ];
