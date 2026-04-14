@@ -27,6 +27,7 @@ in
     ../../desktop-managers/phosh.nix
     ./xfce.nix
     ../../desktop-managers/plasma6.nix
+    ../../desktop-managers/plasma6-mobile.nix
     ./lumina.nix
     ./lxqt.nix
     ./enlightenment.nix
