@@ -88,6 +88,9 @@ let
             # x86 features
             X86_FRED = yes;
             X86_POSTED_MSI = yes;
+
+            MEM_ALLOC_PROFILING = lib.mkForce (option no);
+            MEM_ALLOC_PROFILING_ENABLED_BY_DEFAULT = lib.mkForce (option no);
           }
           // lib.optionalAttrs (lib.versionOlder (lib.versions.majorMinor version) "7.0") {
             PREEMPT_VOLUNTARY = lib.mkOverride 60 no;
