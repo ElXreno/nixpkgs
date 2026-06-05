@@ -64,6 +64,12 @@ stdenv.mkDerivation (finalAttrs: {
     hash = "sha256-ExWAYdSFW5plPuS3/jxTPMXIly6zVb5GojE3e37imZM=";
   };
 
+  # Fixes the audio-processing monitor record-stream leak that pins the audio
+  # server at ~100% CPU (Almamu/linux-wallpaperengine#542, #174). Drop once merged upstream.
+  patches = [
+    ./fix-audio-processing-record-stream-leak.patch
+  ];
+
   nativeBuildInputs = [
     autoPatchelfHook
     cmake
