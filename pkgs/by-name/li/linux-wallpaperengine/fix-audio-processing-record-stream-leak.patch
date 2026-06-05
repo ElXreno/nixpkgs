@@ -1,0 +1,134 @@
+From a568328110f19bdddd82753e1bb4e0d37ea359be Mon Sep 17 00:00:00 2001
+From: ElXreno <elxreno@gmail.com>
+Date: Fri, 5 Jun 2026 19:39:16 +0300
+Subject: [PATCH] audio: fix PulseAudio monitor record-stream leak
+
+pa_server_info_cb runs on every sink/source subscribe event and recreated the
+monitor capture stream each time, releasing the previous one with
+pa_stream_unref() only. Without a pa_stream_disconnect() the server-side record
+stream is leaked and keeps capturing, so on systems with frequent sink/source
+churn hundreds of "wallpaperengine-audioprocessing" streams pile up and drive
+the audio server (PulseAudio/PipeWire) to ~100% CPU and over 1GB of RAM.
+
+Tear the stream down properly (detach callbacks, disconnect, unref, null) via a
+shared helper used on replace, on connect failure and in the destructor, and
+only re-take the stream when the default sink's monitor actually changed instead
+of on every event.
+
+Fixes #542
+Fixes #174
+---
+ .../Recorders/PulseAudioPlaybackRecorder.cpp  | 46 ++++++++++++++-----
+ .../Recorders/PulseAudioPlaybackRecorder.h    |  2 +
+ 2 files changed, 37 insertions(+), 11 deletions(-)
+
+diff --git a/src/WallpaperEngine/Audio/Drivers/Recorders/PulseAudioPlaybackRecorder.cpp b/src/WallpaperEngine/Audio/Drivers/Recorders/PulseAudioPlaybackRecorder.cpp
+index 5831d4a..72d4df5 100644
+--- a/src/WallpaperEngine/Audio/Drivers/Recorders/PulseAudioPlaybackRecorder.cpp
++++ b/src/WallpaperEngine/Audio/Drivers/Recorders/PulseAudioPlaybackRecorder.cpp
+@@ -95,30 +95,54 @@ void pa_stream_read_cb (pa_stream* stream, const size_t /*nbytes*/, void* userda
+     }
+ }
+ 
++void teardown_capture_stream (PulseAudioPlaybackRecorder::PulseAudioData* recorder) {
++    if (recorder->captureStream == nullptr) {
++	return;
++    }
++
++    // Detach callbacks so they cannot fire while we tear the stream down, then disconnect
++    // it (removes the server-side record stream) before dropping our reference. Skipping
++    // the disconnect leaks the source-output, which keeps capturing and overrunning.
++    pa_stream_set_state_callback (recorder->captureStream, nullptr, nullptr);
++    pa_stream_set_read_callback (recorder->captureStream, nullptr, nullptr);
++    pa_stream_disconnect (recorder->captureStream);
++    pa_stream_unref (recorder->captureStream);
++    recorder->captureStream = nullptr;
++}
++
+ void pa_server_info_cb (pa_context* ctx, const pa_server_info* info, void* userdata) {
+-    if (info == nullptr) {
++    if (info == nullptr || info->default_sink_name == nullptr) {
+ 	return;
+     }
+ 
+     auto* recorder = static_cast<PulseAudioPlaybackRecorder::PulseAudioData*> (userdata);
+ 
++    std::string monitor_name (info->default_sink_name);
++    monitor_name += ".monitor";
++
++    // The subscribe callback fires on every sink/source event, not just default-sink
++    // changes. Only re-take the capture stream when the monitor actually changed (or the
++    // current one died); otherwise we leak/churn record streams on unrelated events.
++    if (recorder->captureStream != nullptr && recorder->currentMonitorName == monitor_name) {
++	const pa_stream_state_t state = pa_stream_get_state (recorder->captureStream);
++	if (state == PA_STREAM_CREATING || state == PA_STREAM_READY) {
++	    return;
++	}
++    }
++
++    teardown_capture_stream (recorder);
++    recorder->currentMonitorName = monitor_name;
++
+     pa_sample_spec spec;
+     spec.format = PA_SAMPLE_U8;
+     spec.rate = 44100;
+     spec.channels = 1;
+ 
+-    if (recorder->captureStream) {
+-	pa_stream_unref (recorder->captureStream);
+-    }
+-
+     recorder->captureStream = pa_stream_new (ctx, "output monitor", &spec, nullptr);
+ 
+     pa_stream_set_state_callback (recorder->captureStream, &pa_stream_notify_cb, userdata);
+     pa_stream_set_read_callback (recorder->captureStream, &pa_stream_read_cb, userdata);
+ 
+-    std::string monitor_name (info->default_sink_name);
+-    monitor_name += ".monitor";
+-
+     // setup latency
+     pa_buffer_attr attr {};
+ 
+@@ -130,6 +154,8 @@ void pa_server_info_cb (pa_context* ctx, const pa_server_info* info, void* userd
+     if (pa_stream_connect_record (recorder->captureStream, monitor_name.c_str (), &attr, PA_STREAM_ADJUST_LATENCY)
+ 	!= 0) {
+ 	sLog.error ("Failed to connect to input for recording");
++	teardown_capture_stream (recorder);
++	recorder->currentMonitorName.clear ();
+     }
+ }
+ 
+@@ -198,9 +224,7 @@ PulseAudioPlaybackRecorder::PulseAudioPlaybackRecorder () :
+ }
+ 
+ PulseAudioPlaybackRecorder::~PulseAudioPlaybackRecorder () {
+-    if (m_captureData.captureStream) {
+-	pa_stream_unref (m_captureData.captureStream);
+-    }
++    teardown_capture_stream (&this->m_captureData);
+ 
+     delete[] this->m_captureData.audioBufferTmp;
+     delete[] this->m_captureData.audioBuffer;
+diff --git a/src/WallpaperEngine/Audio/Drivers/Recorders/PulseAudioPlaybackRecorder.h b/src/WallpaperEngine/Audio/Drivers/Recorders/PulseAudioPlaybackRecorder.h
+index ac6c034..9f4ae98 100644
+--- a/src/WallpaperEngine/Audio/Drivers/Recorders/PulseAudioPlaybackRecorder.h
++++ b/src/WallpaperEngine/Audio/Drivers/Recorders/PulseAudioPlaybackRecorder.h
+@@ -3,6 +3,7 @@
+ #include "PlaybackRecorder.h"
+ #include "kiss_fftr.h"
+ #include <pulse/pulseaudio.h>
++#include <string>
+ 
+ #define WAVE_BUFFER_SIZE 1024
+ 
+@@ -21,6 +22,7 @@ public:
+ 	size_t currentWritePointer;
+ 	bool fullFrameReady;
+ 	pa_stream* captureStream;
++	std::string currentMonitorName;
+     };
+ 
+     PulseAudioPlaybackRecorder ();
+-- 
+2.54.0
+
