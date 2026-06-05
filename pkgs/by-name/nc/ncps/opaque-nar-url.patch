@@ -1,0 +1,1305 @@
+From 385e7c735b7baeccdfa185a8df0b1cb220413f4e Mon Sep 17 00:00:00 2001
+From: Bryan Prather-Huff <bryan@pratherhuff.com>
+Date: Thu, 4 Jun 2026 22:54:57 -0500
+Subject: [PATCH] fix(cache): tolerate opaque (non-hash) upstream NAR URLs
+
+When an upstream narinfo's URL: field is not hash-named (e.g. cachix
+serves nar/<uuidv4>.nar.zst), ParseURL rejected it as an "invalid nar
+hash" and the whole narinfo fetch aborted with HTTP 500. Nix treats a
+500 as a hard error (worse than a 404), so this broke substitution for
+every affected path once a fleet proxied a cachix-backed cache.
+
+The Nix binary-cache protocol treats the narinfo URL: field as an opaque
+path relative to the cache root, so a pull-through proxy must tolerate
+non hash-named URLs rather than reject them. Decouple ncps's storage key
+from the upstream URL string:
+
+- pkg/nar: add ParseUpstreamURL(u, fallbackHash). Hash-named URLs behave
+  exactly like ParseURL; opaque URLs preserve the original path for the
+  upstream GET (new opaquePath field, used only by JoinURL) and key
+  local storage off fallbackHash (the narinfo NarHash). Adds IsOpaque,
+  OpaquePath and WithOpaquePath.
+- ent: add nullable narinfos.upstream_url, persisting the opaque upstream
+  path so the NAR can be re-fetched from upstream after local eviction.
+- cache: pullNarInfo parses via ParseUpstreamURL (NarHash-derived key),
+  re-serves the NAR under ncps's own hash-named URL, and persists the
+  opaque path. lookupOriginalNarURL restores it for re-fetch;
+  lookupPreferredUpstreamURL is made opaque-aware for CDC.
+
+The hash-named fast path is unchanged, so this is purely additive.
+
+Fixes bryandph/ncps#1
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ ent/migrate/schema.go                         |   3 +-
+ ent/mutation.go                               |  75 ++++++++++-
+ ent/narinfo.go                                |  16 ++-
+ ent/narinfo/narinfo.go                        |   8 ++
+ ent/narinfo/where.go                          |  80 ++++++++++++
+ ent/narinfo_create.go                         |  78 ++++++++++++
+ ent/narinfo_update.go                         |  52 ++++++++
+ ent/runtime.go                                |   2 +-
+ ent/schema/narinfo.go                         |   6 +
+ ...0260605034000_add_narinfo_upstream_url.sql |   7 ++
+ migrations/mysql/atlas.sum                    |   3 +-
+ ...0260605033958_add_narinfo_upstream_url.sql |   7 ++
+ migrations/postgres/atlas.sum                 |   3 +-
+ ...0260605033958_add_narinfo_upstream_url.sql |  43 +++++++
+ migrations/sqlite/atlas.sum                   |   3 +-
+ pkg/cache/cache.go                            |  69 +++++++++-
+ pkg/cache/cache_test.go                       | 116 +++++++++++++++++
+ pkg/nar/url.go                                | 119 +++++++++++++++---
+ pkg/nar/url_test.go                           |  98 +++++++++++++++
+ 19 files changed, 760 insertions(+), 28 deletions(-)
+ create mode 100644 migrations/mysql/20260605034000_add_narinfo_upstream_url.sql
+ create mode 100644 migrations/postgres/20260605033958_add_narinfo_upstream_url.sql
+ create mode 100644 migrations/sqlite/20260605033958_add_narinfo_upstream_url.sql
+
+diff --git a/ent/migrate/schema.go b/ent/migrate/schema.go
+index 0649eff..0e07aca 100644
+--- a/ent/migrate/schema.go
++++ b/ent/migrate/schema.go
+@@ -187,6 +187,7 @@ var (
+ 		{Name: "hash", Type: field.TypeString},
+ 		{Name: "store_path", Type: field.TypeString, Nullable: true},
+ 		{Name: "url", Type: field.TypeString, Nullable: true},
++		{Name: "upstream_url", Type: field.TypeString, Nullable: true},
+ 		{Name: "compression", Type: field.TypeString, Nullable: true},
+ 		{Name: "file_hash", Type: field.TypeString, Nullable: true},
+ 		{Name: "file_size", Type: field.TypeInt64, Nullable: true},
+@@ -211,7 +212,7 @@ var (
+ 			{
+ 				Name:    "narinfo_last_accessed_at",
+ 				Unique:  false,
+-				Columns: []*schema.Column{NarinfosColumns[14]},
++				Columns: []*schema.Column{NarinfosColumns[15]},
+ 			},
+ 		},
+ 	}
+diff --git a/ent/mutation.go b/ent/mutation.go
+index 7ce0c55..8b84851 100644
+--- a/ent/mutation.go
++++ b/ent/mutation.go
+@@ -4202,6 +4202,7 @@ type NarInfoMutation struct {
+ 	hash                      *string
+ 	store_path                *string
+ 	url                       *string
++	upstream_url              *string
+ 	compression               *string
+ 	file_hash                 *string
+ 	file_size                 *int64
+@@ -4545,6 +4546,55 @@ func (m *NarInfoMutation) ResetURL() {
+ 	delete(m.clearedFields, narinfo.FieldURL)
+ }
+ 
++// SetUpstreamURL sets the "upstream_url" field.
++func (m *NarInfoMutation) SetUpstreamURL(s string) {
++	m.upstream_url = &s
++}
++
++// UpstreamURL returns the value of the "upstream_url" field in the mutation.
++func (m *NarInfoMutation) UpstreamURL() (r string, exists bool) {
++	v := m.upstream_url
++	if v == nil {
++		return
++	}
++	return *v, true
++}
++
++// OldUpstreamURL returns the old "upstream_url" field's value of the NarInfo entity.
++// If the NarInfo object wasn't provided to the builder, the object is fetched from the database.
++// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
++func (m *NarInfoMutation) OldUpstreamURL(ctx context.Context) (v *string, err error) {
++	if !m.op.Is(OpUpdateOne) {
++		return v, errors.New("OldUpstreamURL is only allowed on UpdateOne operations")
++	}
++	if m.id == nil || m.oldValue == nil {
++		return v, errors.New("OldUpstreamURL requires an ID field in the mutation")
++	}
++	oldValue, err := m.oldValue(ctx)
++	if err != nil {
++		return v, fmt.Errorf("querying old value for OldUpstreamURL: %w", err)
++	}
++	return oldValue.UpstreamURL, nil
++}
++
++// ClearUpstreamURL clears the value of the "upstream_url" field.
++func (m *NarInfoMutation) ClearUpstreamURL() {
++	m.upstream_url = nil
++	m.clearedFields[narinfo.FieldUpstreamURL] = struct{}{}
++}
++
++// UpstreamURLCleared returns if the "upstream_url" field was cleared in this mutation.
++func (m *NarInfoMutation) UpstreamURLCleared() bool {
++	_, ok := m.clearedFields[narinfo.FieldUpstreamURL]
++	return ok
++}
++
++// ResetUpstreamURL resets all changes to the "upstream_url" field.
++func (m *NarInfoMutation) ResetUpstreamURL() {
++	m.upstream_url = nil
++	delete(m.clearedFields, narinfo.FieldUpstreamURL)
++}
++
+ // SetCompression sets the "compression" field.
+ func (m *NarInfoMutation) SetCompression(s string) {
+ 	m.compression = &s
+@@ -5224,7 +5274,7 @@ func (m *NarInfoMutation) Type() string {
+ // order to get all numeric fields that were incremented/decremented, call
+ // AddedFields().
+ func (m *NarInfoMutation) Fields() []string {
+-	fields := make([]string, 0, 14)
++	fields := make([]string, 0, 15)
+ 	if m.created_at != nil {
+ 		fields = append(fields, narinfo.FieldCreatedAt)
+ 	}
+@@ -5240,6 +5290,9 @@ func (m *NarInfoMutation) Fields() []string {
+ 	if m.url != nil {
+ 		fields = append(fields, narinfo.FieldURL)
+ 	}
++	if m.upstream_url != nil {
++		fields = append(fields, narinfo.FieldUpstreamURL)
++	}
+ 	if m.compression != nil {
+ 		fields = append(fields, narinfo.FieldCompression)
+ 	}
+@@ -5285,6 +5338,8 @@ func (m *NarInfoMutation) Field(name string) (ent.Value, bool) {
+ 		return m.StorePath()
+ 	case narinfo.FieldURL:
+ 		return m.URL()
++	case narinfo.FieldUpstreamURL:
++		return m.UpstreamURL()
+ 	case narinfo.FieldCompression:
+ 		return m.Compression()
+ 	case narinfo.FieldFileHash:
+@@ -5322,6 +5377,8 @@ func (m *NarInfoMutation) OldField(ctx context.Context, name string) (ent.Value,
+ 		return m.OldStorePath(ctx)
+ 	case narinfo.FieldURL:
+ 		return m.OldURL(ctx)
++	case narinfo.FieldUpstreamURL:
++		return m.OldUpstreamURL(ctx)
+ 	case narinfo.FieldCompression:
+ 		return m.OldCompression(ctx)
+ 	case narinfo.FieldFileHash:
+@@ -5384,6 +5441,13 @@ func (m *NarInfoMutation) SetField(name string, value ent.Value) error {
+ 		}
+ 		m.SetURL(v)
+ 		return nil
++	case narinfo.FieldUpstreamURL:
++		v, ok := value.(string)
++		if !ok {
++			return fmt.Errorf("unexpected type %T for field %s", value, name)
++		}
++		m.SetUpstreamURL(v)
++		return nil
+ 	case narinfo.FieldCompression:
+ 		v, ok := value.(string)
+ 		if !ok {
+@@ -5513,6 +5577,9 @@ func (m *NarInfoMutation) ClearedFields() []string {
+ 	if m.FieldCleared(narinfo.FieldURL) {
+ 		fields = append(fields, narinfo.FieldURL)
+ 	}
++	if m.FieldCleared(narinfo.FieldUpstreamURL) {
++		fields = append(fields, narinfo.FieldUpstreamURL)
++	}
+ 	if m.FieldCleared(narinfo.FieldCompression) {
+ 		fields = append(fields, narinfo.FieldCompression)
+ 	}
+@@ -5563,6 +5630,9 @@ func (m *NarInfoMutation) ClearField(name string) error {
+ 	case narinfo.FieldURL:
+ 		m.ClearURL()
+ 		return nil
++	case narinfo.FieldUpstreamURL:
++		m.ClearUpstreamURL()
++		return nil
+ 	case narinfo.FieldCompression:
+ 		m.ClearCompression()
+ 		return nil
+@@ -5613,6 +5683,9 @@ func (m *NarInfoMutation) ResetField(name string) error {
+ 	case narinfo.FieldURL:
+ 		m.ResetURL()
+ 		return nil
++	case narinfo.FieldUpstreamURL:
++		m.ResetUpstreamURL()
++		return nil
+ 	case narinfo.FieldCompression:
+ 		m.ResetCompression()
+ 		return nil
+diff --git a/ent/narinfo.go b/ent/narinfo.go
+index a720dc4..4fbb244 100644
+--- a/ent/narinfo.go
++++ b/ent/narinfo.go
+@@ -27,6 +27,8 @@ type NarInfo struct {
+ 	StorePath *string `json:"store_path,omitempty"`
+ 	// URL holds the value of the "url" field.
+ 	URL *string `json:"url,omitempty"`
++	// UpstreamURL holds the value of the "upstream_url" field.
++	UpstreamURL *string `json:"upstream_url,omitempty"`
+ 	// Compression holds the value of the "compression" field.
+ 	Compression *string `json:"compression,omitempty"`
+ 	// FileHash holds the value of the "file_hash" field.
+@@ -98,7 +100,7 @@ func (*NarInfo) scanValues(columns []string) ([]any, error) {
+ 		switch columns[i] {
+ 		case narinfo.FieldID, narinfo.FieldFileSize, narinfo.FieldNarSize:
+ 			values[i] = new(sql.NullInt64)
+-		case narinfo.FieldHash, narinfo.FieldStorePath, narinfo.FieldURL, narinfo.FieldCompression, narinfo.FieldFileHash, narinfo.FieldNarHash, narinfo.FieldDeriver, narinfo.FieldSystem, narinfo.FieldCa:
++		case narinfo.FieldHash, narinfo.FieldStorePath, narinfo.FieldURL, narinfo.FieldUpstreamURL, narinfo.FieldCompression, narinfo.FieldFileHash, narinfo.FieldNarHash, narinfo.FieldDeriver, narinfo.FieldSystem, narinfo.FieldCa:
+ 			values[i] = new(sql.NullString)
+ 		case narinfo.FieldCreatedAt, narinfo.FieldUpdatedAt, narinfo.FieldLastAccessedAt:
+ 			values[i] = new(sql.NullTime)
+@@ -156,6 +158,13 @@ func (_m *NarInfo) assignValues(columns []string, values []any) error {
+ 				_m.URL = new(string)
+ 				*_m.URL = value.String
+ 			}
++		case narinfo.FieldUpstreamURL:
++			if value, ok := values[i].(*sql.NullString); !ok {
++				return fmt.Errorf("unexpected type %T for field upstream_url", values[i])
++			} else if value.Valid {
++				_m.UpstreamURL = new(string)
++				*_m.UpstreamURL = value.String
++			}
+ 		case narinfo.FieldCompression:
+ 			if value, ok := values[i].(*sql.NullString); !ok {
+ 				return fmt.Errorf("unexpected type %T for field compression", values[i])
+@@ -291,6 +300,11 @@ func (_m *NarInfo) String() string {
+ 		builder.WriteString(*v)
+ 	}
+ 	builder.WriteString(", ")
++	if v := _m.UpstreamURL; v != nil {
++		builder.WriteString("upstream_url=")
++		builder.WriteString(*v)
++	}
++	builder.WriteString(", ")
+ 	if v := _m.Compression; v != nil {
+ 		builder.WriteString("compression=")
+ 		builder.WriteString(*v)
+diff --git a/ent/narinfo/narinfo.go b/ent/narinfo/narinfo.go
+index d21292a..8a66684 100644
+--- a/ent/narinfo/narinfo.go
++++ b/ent/narinfo/narinfo.go
+@@ -24,6 +24,8 @@ const (
+ 	FieldStorePath = "store_path"
+ 	// FieldURL holds the string denoting the url field in the database.
+ 	FieldURL = "url"
++	// FieldUpstreamURL holds the string denoting the upstream_url field in the database.
++	FieldUpstreamURL = "upstream_url"
+ 	// FieldCompression holds the string denoting the compression field in the database.
+ 	FieldCompression = "compression"
+ 	// FieldFileHash holds the string denoting the file_hash field in the database.
+@@ -81,6 +83,7 @@ var Columns = []string{
+ 	FieldHash,
+ 	FieldStorePath,
+ 	FieldURL,
++	FieldUpstreamURL,
+ 	FieldCompression,
+ 	FieldFileHash,
+ 	FieldFileSize,
+@@ -144,6 +147,11 @@ func ByURL(opts ...sql.OrderTermOption) OrderOption {
+ 	return sql.OrderByField(FieldURL, opts...).ToFunc()
+ }
+ 
++// ByUpstreamURL orders the results by the upstream_url field.
++func ByUpstreamURL(opts ...sql.OrderTermOption) OrderOption {
++	return sql.OrderByField(FieldUpstreamURL, opts...).ToFunc()
++}
++
+ // ByCompression orders the results by the compression field.
+ func ByCompression(opts ...sql.OrderTermOption) OrderOption {
+ 	return sql.OrderByField(FieldCompression, opts...).ToFunc()
+diff --git a/ent/narinfo/where.go b/ent/narinfo/where.go
+index d9542b8..40b1964 100644
+--- a/ent/narinfo/where.go
++++ b/ent/narinfo/where.go
+@@ -80,6 +80,11 @@ func URL(v string) predicate.NarInfo {
+ 	return predicate.NarInfo(sql.FieldEQ(FieldURL, v))
+ }
+ 
++// UpstreamURL applies equality check predicate on the "upstream_url" field. It's identical to UpstreamURLEQ.
++func UpstreamURL(v string) predicate.NarInfo {
++	return predicate.NarInfo(sql.FieldEQ(FieldUpstreamURL, v))
++}
++
+ // Compression applies equality check predicate on the "compression" field. It's identical to CompressionEQ.
+ func Compression(v string) predicate.NarInfo {
+ 	return predicate.NarInfo(sql.FieldEQ(FieldCompression, v))
+@@ -430,6 +435,81 @@ func URLContainsFold(v string) predicate.NarInfo {
+ 	return predicate.NarInfo(sql.FieldContainsFold(FieldURL, v))
+ }
+ 
++// UpstreamURLEQ applies the EQ predicate on the "upstream_url" field.
++func UpstreamURLEQ(v string) predicate.NarInfo {
++	return predicate.NarInfo(sql.FieldEQ(FieldUpstreamURL, v))
++}
++
++// UpstreamURLNEQ applies the NEQ predicate on the "upstream_url" field.
++func UpstreamURLNEQ(v string) predicate.NarInfo {
++	return predicate.NarInfo(sql.FieldNEQ(FieldUpstreamURL, v))
++}
++
++// UpstreamURLIn applies the In predicate on the "upstream_url" field.
++func UpstreamURLIn(vs ...string) predicate.NarInfo {
++	return predicate.NarInfo(sql.FieldIn(FieldUpstreamURL, vs...))
++}
++
++// UpstreamURLNotIn applies the NotIn predicate on the "upstream_url" field.
++func UpstreamURLNotIn(vs ...string) predicate.NarInfo {
++	return predicate.NarInfo(sql.FieldNotIn(FieldUpstreamURL, vs...))
++}
++
++// UpstreamURLGT applies the GT predicate on the "upstream_url" field.
++func UpstreamURLGT(v string) predicate.NarInfo {
++	return predicate.NarInfo(sql.FieldGT(FieldUpstreamURL, v))
++}
++
++// UpstreamURLGTE applies the GTE predicate on the "upstream_url" field.
++func UpstreamURLGTE(v string) predicate.NarInfo {
++	return predicate.NarInfo(sql.FieldGTE(FieldUpstreamURL, v))
++}
++
++// UpstreamURLLT applies the LT predicate on the "upstream_url" field.
++func UpstreamURLLT(v string) predicate.NarInfo {
++	return predicate.NarInfo(sql.FieldLT(FieldUpstreamURL, v))
++}
++
++// UpstreamURLLTE applies the LTE predicate on the "upstream_url" field.
++func UpstreamURLLTE(v string) predicate.NarInfo {
++	return predicate.NarInfo(sql.FieldLTE(FieldUpstreamURL, v))
++}
++
++// UpstreamURLContains applies the Contains predicate on the "upstream_url" field.
++func UpstreamURLContains(v string) predicate.NarInfo {
++	return predicate.NarInfo(sql.FieldContains(FieldUpstreamURL, v))
++}
++
++// UpstreamURLHasPrefix applies the HasPrefix predicate on the "upstream_url" field.
++func UpstreamURLHasPrefix(v string) predicate.NarInfo {
++	return predicate.NarInfo(sql.FieldHasPrefix(FieldUpstreamURL, v))
++}
++
++// UpstreamURLHasSuffix applies the HasSuffix predicate on the "upstream_url" field.
++func UpstreamURLHasSuffix(v string) predicate.NarInfo {
++	return predicate.NarInfo(sql.FieldHasSuffix(FieldUpstreamURL, v))
++}
++
++// UpstreamURLIsNil applies the IsNil predicate on the "upstream_url" field.
++func UpstreamURLIsNil() predicate.NarInfo {
++	return predicate.NarInfo(sql.FieldIsNull(FieldUpstreamURL))
++}
++
++// UpstreamURLNotNil applies the NotNil predicate on the "upstream_url" field.
++func UpstreamURLNotNil() predicate.NarInfo {
++	return predicate.NarInfo(sql.FieldNotNull(FieldUpstreamURL))
++}
++
++// UpstreamURLEqualFold applies the EqualFold predicate on the "upstream_url" field.
++func UpstreamURLEqualFold(v string) predicate.NarInfo {
++	return predicate.NarInfo(sql.FieldEqualFold(FieldUpstreamURL, v))
++}
++
++// UpstreamURLContainsFold applies the ContainsFold predicate on the "upstream_url" field.
++func UpstreamURLContainsFold(v string) predicate.NarInfo {
++	return predicate.NarInfo(sql.FieldContainsFold(FieldUpstreamURL, v))
++}
++
+ // CompressionEQ applies the EQ predicate on the "compression" field.
+ func CompressionEQ(v string) predicate.NarInfo {
+ 	return predicate.NarInfo(sql.FieldEQ(FieldCompression, v))
+diff --git a/ent/narinfo_create.go b/ent/narinfo_create.go
+index e3ac618..812fe04 100644
+--- a/ent/narinfo_create.go
++++ b/ent/narinfo_create.go
+@@ -87,6 +87,20 @@ func (_c *NarInfoCreate) SetNillableURL(v *string) *NarInfoCreate {
+ 	return _c
+ }
+ 
++// SetUpstreamURL sets the "upstream_url" field.
++func (_c *NarInfoCreate) SetUpstreamURL(v string) *NarInfoCreate {
++	_c.mutation.SetUpstreamURL(v)
++	return _c
++}
++
++// SetNillableUpstreamURL sets the "upstream_url" field if the given value is not nil.
++func (_c *NarInfoCreate) SetNillableUpstreamURL(v *string) *NarInfoCreate {
++	if v != nil {
++		_c.SetUpstreamURL(*v)
++	}
++	return _c
++}
++
+ // SetCompression sets the "compression" field.
+ func (_c *NarInfoCreate) SetCompression(v string) *NarInfoCreate {
+ 	_c.mutation.SetCompression(v)
+@@ -363,6 +377,10 @@ func (_c *NarInfoCreate) createSpec() (*NarInfo, *sqlgraph.CreateSpec) {
+ 		_spec.SetField(narinfo.FieldURL, field.TypeString, value)
+ 		_node.URL = &value
+ 	}
++	if value, ok := _c.mutation.UpstreamURL(); ok {
++		_spec.SetField(narinfo.FieldUpstreamURL, field.TypeString, value)
++		_node.UpstreamURL = &value
++	}
+ 	if value, ok := _c.mutation.Compression(); ok {
+ 		_spec.SetField(narinfo.FieldCompression, field.TypeString, value)
+ 		_node.Compression = &value
+@@ -565,6 +583,24 @@ func (u *NarInfoUpsert) ClearURL() *NarInfoUpsert {
+ 	return u
+ }
+ 
++// SetUpstreamURL sets the "upstream_url" field.
++func (u *NarInfoUpsert) SetUpstreamURL(v string) *NarInfoUpsert {
++	u.Set(narinfo.FieldUpstreamURL, v)
++	return u
++}
++
++// UpdateUpstreamURL sets the "upstream_url" field to the value that was provided on create.
++func (u *NarInfoUpsert) UpdateUpstreamURL() *NarInfoUpsert {
++	u.SetExcluded(narinfo.FieldUpstreamURL)
++	return u
++}
++
++// ClearUpstreamURL clears the value of the "upstream_url" field.
++func (u *NarInfoUpsert) ClearUpstreamURL() *NarInfoUpsert {
++	u.SetNull(narinfo.FieldUpstreamURL)
++	return u
++}
++
+ // SetCompression sets the "compression" field.
+ func (u *NarInfoUpsert) SetCompression(v string) *NarInfoUpsert {
+ 	u.Set(narinfo.FieldCompression, v)
+@@ -861,6 +897,27 @@ func (u *NarInfoUpsertOne) ClearURL() *NarInfoUpsertOne {
+ 	})
+ }
+ 
++// SetUpstreamURL sets the "upstream_url" field.
++func (u *NarInfoUpsertOne) SetUpstreamURL(v string) *NarInfoUpsertOne {
++	return u.Update(func(s *NarInfoUpsert) {
++		s.SetUpstreamURL(v)
++	})
++}
++
++// UpdateUpstreamURL sets the "upstream_url" field to the value that was provided on create.
++func (u *NarInfoUpsertOne) UpdateUpstreamURL() *NarInfoUpsertOne {
++	return u.Update(func(s *NarInfoUpsert) {
++		s.UpdateUpstreamURL()
++	})
++}
++
++// ClearUpstreamURL clears the value of the "upstream_url" field.
++func (u *NarInfoUpsertOne) ClearUpstreamURL() *NarInfoUpsertOne {
++	return u.Update(func(s *NarInfoUpsert) {
++		s.ClearUpstreamURL()
++	})
++}
++
+ // SetCompression sets the "compression" field.
+ func (u *NarInfoUpsertOne) SetCompression(v string) *NarInfoUpsertOne {
+ 	return u.Update(func(s *NarInfoUpsert) {
+@@ -1352,6 +1409,27 @@ func (u *NarInfoUpsertBulk) ClearURL() *NarInfoUpsertBulk {
+ 	})
+ }
+ 
++// SetUpstreamURL sets the "upstream_url" field.
++func (u *NarInfoUpsertBulk) SetUpstreamURL(v string) *NarInfoUpsertBulk {
++	return u.Update(func(s *NarInfoUpsert) {
++		s.SetUpstreamURL(v)
++	})
++}
++
++// UpdateUpstreamURL sets the "upstream_url" field to the value that was provided on create.
++func (u *NarInfoUpsertBulk) UpdateUpstreamURL() *NarInfoUpsertBulk {
++	return u.Update(func(s *NarInfoUpsert) {
++		s.UpdateUpstreamURL()
++	})
++}
++
++// ClearUpstreamURL clears the value of the "upstream_url" field.
++func (u *NarInfoUpsertBulk) ClearUpstreamURL() *NarInfoUpsertBulk {
++	return u.Update(func(s *NarInfoUpsert) {
++		s.ClearUpstreamURL()
++	})
++}
++
+ // SetCompression sets the "compression" field.
+ func (u *NarInfoUpsertBulk) SetCompression(v string) *NarInfoUpsertBulk {
+ 	return u.Update(func(s *NarInfoUpsert) {
+diff --git a/ent/narinfo_update.go b/ent/narinfo_update.go
+index 03a2afd..6722ed0 100644
+--- a/ent/narinfo_update.go
++++ b/ent/narinfo_update.go
+@@ -105,6 +105,26 @@ func (_u *NarInfoUpdate) ClearURL() *NarInfoUpdate {
+ 	return _u
+ }
+ 
++// SetUpstreamURL sets the "upstream_url" field.
++func (_u *NarInfoUpdate) SetUpstreamURL(v string) *NarInfoUpdate {
++	_u.mutation.SetUpstreamURL(v)
++	return _u
++}
++
++// SetNillableUpstreamURL sets the "upstream_url" field if the given value is not nil.
++func (_u *NarInfoUpdate) SetNillableUpstreamURL(v *string) *NarInfoUpdate {
++	if v != nil {
++		_u.SetUpstreamURL(*v)
++	}
++	return _u
++}
++
++// ClearUpstreamURL clears the value of the "upstream_url" field.
++func (_u *NarInfoUpdate) ClearUpstreamURL() *NarInfoUpdate {
++	_u.mutation.ClearUpstreamURL()
++	return _u
++}
++
+ // SetCompression sets the "compression" field.
+ func (_u *NarInfoUpdate) SetCompression(v string) *NarInfoUpdate {
+ 	_u.mutation.SetCompression(v)
+@@ -482,6 +502,12 @@ func (_u *NarInfoUpdate) sqlSave(ctx context.Context) (_node int, err error) {
+ 	if _u.mutation.URLCleared() {
+ 		_spec.ClearField(narinfo.FieldURL, field.TypeString)
+ 	}
++	if value, ok := _u.mutation.UpstreamURL(); ok {
++		_spec.SetField(narinfo.FieldUpstreamURL, field.TypeString, value)
++	}
++	if _u.mutation.UpstreamURLCleared() {
++		_spec.ClearField(narinfo.FieldUpstreamURL, field.TypeString)
++	}
+ 	if value, ok := _u.mutation.Compression(); ok {
+ 		_spec.SetField(narinfo.FieldCompression, field.TypeString, value)
+ 	}
+@@ -771,6 +797,26 @@ func (_u *NarInfoUpdateOne) ClearURL() *NarInfoUpdateOne {
+ 	return _u
+ }
+ 
++// SetUpstreamURL sets the "upstream_url" field.
++func (_u *NarInfoUpdateOne) SetUpstreamURL(v string) *NarInfoUpdateOne {
++	_u.mutation.SetUpstreamURL(v)
++	return _u
++}
++
++// SetNillableUpstreamURL sets the "upstream_url" field if the given value is not nil.
++func (_u *NarInfoUpdateOne) SetNillableUpstreamURL(v *string) *NarInfoUpdateOne {
++	if v != nil {
++		_u.SetUpstreamURL(*v)
++	}
++	return _u
++}
++
++// ClearUpstreamURL clears the value of the "upstream_url" field.
++func (_u *NarInfoUpdateOne) ClearUpstreamURL() *NarInfoUpdateOne {
++	_u.mutation.ClearUpstreamURL()
++	return _u
++}
++
+ // SetCompression sets the "compression" field.
+ func (_u *NarInfoUpdateOne) SetCompression(v string) *NarInfoUpdateOne {
+ 	_u.mutation.SetCompression(v)
+@@ -1178,6 +1224,12 @@ func (_u *NarInfoUpdateOne) sqlSave(ctx context.Context) (_node *NarInfo, err er
+ 	if _u.mutation.URLCleared() {
+ 		_spec.ClearField(narinfo.FieldURL, field.TypeString)
+ 	}
++	if value, ok := _u.mutation.UpstreamURL(); ok {
++		_spec.SetField(narinfo.FieldUpstreamURL, field.TypeString, value)
++	}
++	if _u.mutation.UpstreamURLCleared() {
++		_spec.ClearField(narinfo.FieldUpstreamURL, field.TypeString)
++	}
+ 	if value, ok := _u.mutation.Compression(); ok {
+ 		_spec.SetField(narinfo.FieldCompression, field.TypeString, value)
+ 	}
+diff --git a/ent/runtime.go b/ent/runtime.go
+index 2c0e64f..cc229c7 100644
+--- a/ent/runtime.go
++++ b/ent/runtime.go
+@@ -133,7 +133,7 @@ func init() {
+ 	// narinfo.HashValidator is a validator for the "hash" field. It is called by the builders before save.
+ 	narinfo.HashValidator = narinfoDescHash.Validators[0].(func(string) error)
+ 	// narinfoDescLastAccessedAt is the schema descriptor for last_accessed_at field.
+-	narinfoDescLastAccessedAt := narinfoFields[11].Descriptor()
++	narinfoDescLastAccessedAt := narinfoFields[12].Descriptor()
+ 	// narinfo.DefaultLastAccessedAt holds the default value on creation for the last_accessed_at field.
+ 	narinfo.DefaultLastAccessedAt = narinfoDescLastAccessedAt.Default.(func() time.Time)
+ 	narinforeferenceFields := schema.NarInfoReference{}.Fields()
+diff --git a/ent/schema/narinfo.go b/ent/schema/narinfo.go
+index fa73f5d..6615fe8 100644
+--- a/ent/schema/narinfo.go
++++ b/ent/schema/narinfo.go
+@@ -51,6 +51,12 @@ func (NarInfo) Fields() []ent.Field {
+ 		field.String("hash").NotEmpty(),
+ 		field.String("store_path").Optional().Nillable(),
+ 		field.String("url").Optional().Nillable(),
++		// upstream_url preserves the original, opaque upstream NAR path (e.g.
++		// cachix's "nar/<uuid>.nar.zst") when it is not hash-named. The `url`
++		// column holds ncps's own hash-named URL; this column lets the NAR be
++		// re-fetched from upstream after the local copy is evicted. NULL for
++		// conventional hash-named upstreams.
++		field.String("upstream_url").Optional().Nillable(),
+ 		field.String("compression").Optional().Nillable(),
+ 		field.String("file_hash").Optional().Nillable(),
+ 		field.Int64("file_size").Optional().Nillable(),
+diff --git a/migrations/mysql/20260605034000_add_narinfo_upstream_url.sql b/migrations/mysql/20260605034000_add_narinfo_upstream_url.sql
+new file mode 100644
+index 0000000..cc022f2
+--- /dev/null
++++ b/migrations/mysql/20260605034000_add_narinfo_upstream_url.sql
+@@ -0,0 +1,7 @@
++-- +goose Up
++-- modify "narinfos" table
++ALTER TABLE `narinfos` ADD COLUMN `upstream_url` varchar(255) NULL;
++
++-- +goose Down
++-- reverse: modify "narinfos" table
++ALTER TABLE `narinfos` DROP COLUMN `upstream_url`;
+diff --git a/migrations/mysql/atlas.sum b/migrations/mysql/atlas.sum
+index 0ba1c7d..efce1ab 100644
+--- a/migrations/mysql/atlas.sum
++++ b/migrations/mysql/atlas.sum
+@@ -1,4 +1,4 @@
+-h1:uMmpTavOqVUfQqi90tmQxSg0ustHo5nVZ9qhXgb3FdE=
++h1:XQPoI1NuMdaDaLfxsqtxAPkJxlEHhQTPtgXg7sIu4m0=
+ 20260101000000_init_schema.sql h1:N0KkWt38rITrCfEPKF537iQ/sPju469U36SGHESo1uo=
+ 20260117195000_add_narinfo_de_normalized.sql h1:TOqlLxLt9YYiR4WM8LokoiIkAs8zy8QdGz9Mjmqid8U=
+ 20260127223000_allow_multiple_nar_representations.sql h1:I/SDVsS9qrJUw0kQ2rW13EVyGhDR+ahh9ig1/ZFYeJw=
+@@ -9,3 +9,4 @@ h1:uMmpTavOqVUfQqi90tmQxSg0ustHo5nVZ9qhXgb3FdE=
+ 20260318053904_add_pinned_closures_table.sql h1:9U8wF2nLTHqlM+34jGuuM4YvcYC8d7ZtNsHDh7ScjUQ=
+ 20260521021523_ent_baseline.sql h1:F+Nf7fnogLW/lNOMvM8s2LG9y5NS2fGTK1Nmapuai50=
+ 20260525175108_add_build_trace_entries.sql h1:LhDyn7NbhKltgm8iwoxc/7jXLsrG98xWe6ZiwPBc3g0=
++20260605034000_add_narinfo_upstream_url.sql h1:Awno1O0813eba3CEn9LjFeZpPvZQw8hIFcDKOfCz+xA=
+diff --git a/migrations/postgres/20260605033958_add_narinfo_upstream_url.sql b/migrations/postgres/20260605033958_add_narinfo_upstream_url.sql
+new file mode 100644
+index 0000000..8c9335a
+--- /dev/null
++++ b/migrations/postgres/20260605033958_add_narinfo_upstream_url.sql
+@@ -0,0 +1,7 @@
++-- +goose Up
++-- modify "narinfos" table
++ALTER TABLE "narinfos" ADD COLUMN "upstream_url" character varying NULL;
++
++-- +goose Down
++-- reverse: modify "narinfos" table
++ALTER TABLE "narinfos" DROP COLUMN "upstream_url";
+diff --git a/migrations/postgres/atlas.sum b/migrations/postgres/atlas.sum
+index c6854f0..773718b 100644
+--- a/migrations/postgres/atlas.sum
++++ b/migrations/postgres/atlas.sum
+@@ -1,4 +1,4 @@
+-h1:ZqCreYcGcq3zJuMqoKaudVXhIKQbCPegxohRmI/8Vek=
++h1:mrGI4n8i8Vi6tInjRTxVNnXiGKb5Z0AE+91JxpN+ZoE=
+ 20260101000000_init_schema.sql h1:iedAD2OJAMzrmUpAUO8zhQCuLu5qe5Faz3Tp1qVfVgY=
+ 20260117195000_add_narinfo_de_normalized.sql h1:p1+8hB881Dg9E0XmzJVJUFic/kI9rLUzJrDRUhu8UPM=
+ 20260127223000_allow_multiple_nar_representations.sql h1:cys3Xi4rBtMzSeKR7iRNGaoOilKYrC0nqrJ2vuNDMN0=
+@@ -10,3 +10,4 @@ h1:ZqCreYcGcq3zJuMqoKaudVXhIKQbCPegxohRmI/8Vek=
+ 20260520212038_postgres_serial_to_identity.sql h1:NxSWMVTc8QrQziw53m+FcHJeMFA1uEuNJH/Qh6Lt2w4=
+ 20260521021523_ent_baseline.sql h1:utQyB6Qx7h38hR/my9Q9UG5/b9NYIa8LccHktNv6ppE=
+ 20260525175108_add_build_trace_entries.sql h1:GBTZ7v+jdR75k8aiU37kwGrI4RAxWRL9JkFwkD3g3Is=
++20260605033958_add_narinfo_upstream_url.sql h1:PmAPX8uISR2apaqBtQIU0RHTKqM1piSbob0R5PL05j8=
+diff --git a/migrations/sqlite/20260605033958_add_narinfo_upstream_url.sql b/migrations/sqlite/20260605033958_add_narinfo_upstream_url.sql
+new file mode 100644
+index 0000000..a084be4
+--- /dev/null
++++ b/migrations/sqlite/20260605033958_add_narinfo_upstream_url.sql
+@@ -0,0 +1,43 @@
++-- +goose Up
++-- disable the enforcement of foreign-keys constraints
++PRAGMA foreign_keys = off;
++-- create "new_narinfos" table
++CREATE TABLE `new_narinfos` (`id` integer NOT NULL PRIMARY KEY AUTOINCREMENT, `created_at` datetime NOT NULL DEFAULT (CURRENT_TIMESTAMP), `updated_at` datetime NULL, `hash` text NOT NULL, `store_path` text NULL, `url` text NULL, `upstream_url` text NULL, `compression` text NULL, `file_hash` text NULL, `file_size` integer NULL, `nar_hash` text NULL, `nar_size` integer NULL, `deriver` text NULL, `system` text NULL, `ca` text NULL, `last_accessed_at` datetime NULL DEFAULT (CURRENT_TIMESTAMP), CONSTRAINT `narinfos_file_size_nonneg` CHECK (file_size >= 0), CONSTRAINT `narinfos_nar_size_nonneg` CHECK (nar_size >= 0));
++-- copy rows from old table "narinfos" to new temporary table "new_narinfos"
++INSERT INTO `new_narinfos` (`id`, `created_at`, `updated_at`, `hash`, `store_path`, `url`, `compression`, `file_hash`, `file_size`, `nar_hash`, `nar_size`, `deriver`, `system`, `ca`, `last_accessed_at`) SELECT `id`, `created_at`, `updated_at`, `hash`, `store_path`, `url`, `compression`, `file_hash`, `file_size`, `nar_hash`, `nar_size`, `deriver`, `system`, `ca`, `last_accessed_at` FROM `narinfos`;
++-- drop "narinfos" table after copying rows
++DROP TABLE `narinfos`;
++-- rename temporary table "new_narinfos" to "narinfos"
++ALTER TABLE `new_narinfos` RENAME TO `narinfos`;
++-- create index "narinfo_hash" to table: "narinfos"
++CREATE UNIQUE INDEX `narinfo_hash` ON `narinfos` (`hash`);
++-- create index "narinfo_last_accessed_at" to table: "narinfos"
++CREATE INDEX `narinfo_last_accessed_at` ON `narinfos` (`last_accessed_at`);
++-- create "new_nar_files" table
++CREATE TABLE `new_nar_files` (`id` integer NOT NULL PRIMARY KEY AUTOINCREMENT, `created_at` datetime NOT NULL DEFAULT (CURRENT_TIMESTAMP), `updated_at` datetime NULL, `hash` text NOT NULL, `compression` text NOT NULL DEFAULT (''), `file_size` integer NOT NULL, `query` text NOT NULL DEFAULT (''), `total_chunks` integer NOT NULL DEFAULT (0), `chunking_started_at` datetime NULL, `verified_at` datetime NULL, `last_accessed_at` datetime NULL DEFAULT (CURRENT_TIMESTAMP));
++-- copy rows from old table "nar_files" to new temporary table "new_nar_files"
++INSERT INTO `new_nar_files` (`id`, `created_at`, `updated_at`, `hash`, `compression`, `file_size`, `query`, `total_chunks`, `chunking_started_at`, `verified_at`, `last_accessed_at`) SELECT `id`, `created_at`, `updated_at`, `hash`, `compression`, `file_size`, `query`, `total_chunks`, `chunking_started_at`, `verified_at`, `last_accessed_at` FROM `nar_files`;
++-- drop "nar_files" table after copying rows
++DROP TABLE `nar_files`;
++-- rename temporary table "new_nar_files" to "nar_files"
++ALTER TABLE `new_nar_files` RENAME TO `nar_files`;
++-- create index "narfile_hash_compression_query" to table: "nar_files"
++CREATE UNIQUE INDEX `narfile_hash_compression_query` ON `nar_files` (`hash`, `compression`, `query`);
++-- create index "narfile_last_accessed_at" to table: "nar_files"
++CREATE INDEX `narfile_last_accessed_at` ON `nar_files` (`last_accessed_at`);
++-- enable back the enforcement of foreign-keys constraints
++PRAGMA foreign_keys = on;
++
++-- +goose Down
++-- reverse: create index "narfile_last_accessed_at" to table: "nar_files"
++DROP INDEX `narfile_last_accessed_at`;
++-- reverse: create index "narfile_hash_compression_query" to table: "nar_files"
++DROP INDEX `narfile_hash_compression_query`;
++-- reverse: create "new_nar_files" table
++DROP TABLE `new_nar_files`;
++-- reverse: create index "narinfo_last_accessed_at" to table: "narinfos"
++DROP INDEX `narinfo_last_accessed_at`;
++-- reverse: create index "narinfo_hash" to table: "narinfos"
++DROP INDEX `narinfo_hash`;
++-- reverse: create "new_narinfos" table
++DROP TABLE `new_narinfos`;
+diff --git a/migrations/sqlite/atlas.sum b/migrations/sqlite/atlas.sum
+index 0916ebf..a6444a7 100644
+--- a/migrations/sqlite/atlas.sum
++++ b/migrations/sqlite/atlas.sum
+@@ -1,4 +1,4 @@
+-h1:HM08+Isdl5Xe9SVclU/YKcVav5PuKGkRR1xU7I1Zs9Y=
++h1:qIP0Dol/dw4XNfq1MFYzshKCmooKgebTnBaht5Fif8M=
+ 20241210054814_create-narinfos-table.sql h1:e8MnIArqBCoUNv8/b0yDnx6ikbaSoPuMp3+j+C/cIPk=
+ 20241210054829_create-nars-table.sql h1:odrcFJuEF0MT6AIEa5Vn8ghpHV7EhIwfOjsIal1ZUW0=
+ 20241213014846_add-query-to-nars-table.sql h1:gFPvhup77Qua+8KlsWxqRLQqbXSr1IZSnpVDOFlR5cM=
+@@ -15,3 +15,4 @@ h1:HM08+Isdl5Xe9SVclU/YKcVav5PuKGkRR1xU7I1Zs9Y=
+ 20260318053903_add_pinned_closures_table.sql h1:9rWx0agGLMR6TDaq1jKPZNKlch4LOnKjb/OaHO5nPmI=
+ 20260521021523_ent_baseline.sql h1:PkCUJB7uREMN8ERWLxSj3msPhjXZYTU3E6PUSmNOGBI=
+ 20260525175108_add_build_trace_entries.sql h1:w416Kn6T/oGdR1VMg3AnszTj7c57H0hUQtykNyB+YN0=
++20260605033958_add_narinfo_upstream_url.sql h1:CwxtPlHne2xRDk3QQvZ2ooKS9tC3C4mAAX9Z5T8OSEU=
+diff --git a/pkg/cache/cache.go b/pkg/cache/cache.go
+index ec39053..97acd4d 100644
+--- a/pkg/cache/cache.go
++++ b/pkg/cache/cache.go
+@@ -1436,6 +1436,34 @@ func (c *Cache) GetNarFileSize(ctx context.Context, nu nar.URL) (int64, error) {
+ // by matching the narinfo that references a nar_file with the given hash.
+ // This is used to recover the original upstream URL (with prefix) when fetching from
+ // nix-serve style upstreams that use prefixed URLs (e.g., narinfohash-narhash).
++// narInfoStorageKey returns the hash ncps uses as its local storage key when an
++// upstream narinfo URL is opaque. It is the narinfo NarHash re-encoded as a
++// bare 52-char nix32 digest (a valid ncps hash). Returns "" when no NarHash is
++// available, in which case opaque URLs cannot be handled.
++func narInfoStorageKey(ni *narinfo.NarInfo) string {
++	if ni == nil || ni.NarHash == nil {
++		return ""
++	}
++
++	return ni.NarHash.Format(nixhash.NixBase32, false)
++}
++
++// setNarInfoUpstreamURL records the opaque upstream NAR path on the narinfo row
++// so the NAR can be re-fetched from upstream after the local copy is evicted.
++func (c *Cache) setNarInfoUpstreamURL(ctx context.Context, hash, upstreamURL string) error {
++	// A single UPDATE is atomic on all three engines, so no explicit
++	// transaction is needed (mirrors migrateNarToChunksCleanup). The write is
++	// best-effort: the caller logs and continues on error.
++	if _, err := c.dbClient.Ent().NarInfo.Update().
++		Where(entnarinfo.HashEQ(hash)).
++		SetUpstreamURL(upstreamURL).
++		Save(ctx); err != nil {
++		return fmt.Errorf("error setting upstream_url for hash %q: %w", hash, err)
++	}
++
++	return nil
++}
++
+ func (c *Cache) lookupOriginalNarURL(ctx context.Context, normalizedNarURL nar.URL) nar.URL {
+ 	ni, err := c.dbClient.Ent().NarInfo.Query().
+ 		Where(entnarinfo.HasNarInfoNarFilesWith(
+@@ -1458,6 +1486,13 @@ func (c *Cache) lookupOriginalNarURL(ctx context.Context, normalizedNarURL nar.U
+ 	if ni.URL != nil && *ni.URL != "" {
+ 		originalURL, parseErr := nar.ParseURL(*ni.URL)
+ 		if parseErr == nil {
++			// If the upstream URL was opaque (e.g. cachix UUID), restore the
++			// preserved path so the upstream GET targets it rather than ncps's
++			// own hash-named URL (which only exists locally).
++			if ni.UpstreamURL != nil && *ni.UpstreamURL != "" {
++				originalURL = originalURL.WithOpaquePath(*ni.UpstreamURL)
++			}
++
+ 			return originalURL
+ 		}
+ 		// Log if we have a URL in the DB but can't parse it.
+@@ -1497,7 +1532,7 @@ func (c *Cache) lookupPreferredUpstreamURL(ctx context.Context, narURL nar.URL)
+ 		return nil, nil
+ 	}
+ 
+-	originalURL, err := nar.ParseURL(upstreamNarInfo.URL)
++	originalURL, err := nar.ParseUpstreamURL(upstreamNarInfo.URL, narInfoStorageKey(upstreamNarInfo))
+ 	if err != nil {
+ 		zerolog.Ctx(ctx).
+ 			Warn().
+@@ -3541,7 +3576,10 @@ func (c *Cache) pullNarInfo(
+ 		ds.setUpstreamHostname(uc.GetHostname())
+ 	}
+ 
+-	narURL, err := nar.ParseURL(narInfo.URL)
++	// Tolerate opaque (non hash-named) upstream NAR URLs (e.g. cachix's UUID
++	// NARs): ParseUpstreamURL preserves the original path for the upstream GET
++	// and keys ncps's local storage off the narinfo NarHash instead.
++	narURL, err := nar.ParseUpstreamURL(narInfo.URL, narInfoStorageKey(narInfo))
+ 	if err != nil {
+ 		zerolog.Ctx(ctx).
+ 			Error().
+@@ -3554,6 +3592,10 @@ func (c *Cache) pullNarInfo(
+ 		return
+ 	}
+ 
++	// Preserve the opaque upstream path (if any) before narURL is potentially
++	// rewritten below, so it can be persisted for re-fetch after eviction.
++	upstreamNarPath := narURL.OpaquePath()
++
+ 	// Signal that we've successfully fetched the narinfo (no streaming for narinfo)
+ 	ds.startOnce.Do(func() { close(ds.start) })
+ 
+@@ -3583,7 +3625,8 @@ func (c *Cache) pullNarInfo(
+ 	// the pointer in a background goroutine. Instead, build the normalized URL string directly.
+ 	// Skip normalization when lazy chunking is enabled - preserve original compression
+ 	// until the NAR is actually chunked.
+-	if (c.isCDCEnabled() && !c.GetCDCLazyChunkingEnabled()) || narInfo.Compression == nar.CompressionTypeNone.String() {
++	switch {
++	case (c.isCDCEnabled() && !c.GetCDCLazyChunkingEnabled()) || narInfo.Compression == nar.CompressionTypeNone.String():
+ 		normalizedURL := nar.URL{Hash: narURL.Hash, Compression: nar.CompressionTypeNone, Query: narURL.Query}
+ 		narInfo.Compression = nar.CompressionTypeNone.String()
+ 		narInfo.URL = normalizedURL.String() // → "nar/hash.nar"
+@@ -3591,6 +3634,13 @@ func (c *Cache) pullNarInfo(
+ 		// Set the FileHash and FileSize to null, not required for compression=none.
+ 		narInfo.FileHash = nil
+ 		narInfo.FileSize = 0
++	case narURL.IsOpaque():
++		// Opaque upstream URL (e.g. cachix UUID): re-serve under ncps's own
++		// hash-named URL keyed off the NarHash, preserving compression. The
++		// opaque path itself is persisted (upstreamNarPath) so the NAR can
++		// still be re-fetched from upstream after the local copy is evicted.
++		rewrittenURL := nar.URL{Hash: narURL.Hash, Compression: narURL.Compression, Query: narURL.Query}
++		narInfo.URL = rewrittenURL.String()
+ 	}
+ 
+ 	if err := c.signNarInfo(ctx, hash, narInfo); err != nil {
+@@ -3617,6 +3667,19 @@ func (c *Cache) pullNarInfo(
+ 		return
+ 	}
+ 
++	// Persist the opaque upstream path so the NAR can be re-fetched from
++	// upstream after the local copy is evicted (the stored narinfo URL is
++	// ncps's own hash-named URL and no longer encodes the opaque path).
++	if upstreamNarPath != "" {
++		if err := c.setNarInfoUpstreamURL(ctx, hash, upstreamNarPath); err != nil {
++			zerolog.Ctx(ctx).
++				Warn().
++				Err(err).
++				Str("upstream_nar_url", upstreamNarPath).
++				Msg("error persisting the opaque upstream nar URL")
++		}
++	}
++
+ 	// Signal that the asset is now in final storage and the distributed lock
+ 	// can be released. MUST be after storeInDatabase succeeds: the coordinator
+ 	// at coordinateDownload waits on ds.stored and then releases the download
+diff --git a/pkg/cache/cache_test.go b/pkg/cache/cache_test.go
+index cc095b0..ff3cf4e 100644
+--- a/pkg/cache/cache_test.go
++++ b/pkg/cache/cache_test.go
+@@ -432,6 +432,122 @@ func testGetNarInfoWithoutSignature(factory cacheFactory) func(*testing.T) {
+ 	}
+ }
+ 
++// TestGetNarInfoOpaqueUpstreamURL exercises ncps #1: an upstream narinfo whose
++// URL: field is opaque (not hash-named — e.g. cachix's UUID NARs) must be
++// proxied successfully rather than failing with HTTP 500 "invalid nar hash".
++// ncps keys its storage off the narinfo NarHash, re-serves the NAR under its
++// own hash-named URL, and persists the opaque path so the NAR can be re-fetched
++// from upstream after eviction.
++func TestGetNarInfoOpaqueUpstreamURL(t *testing.T) {
++	t.Parallel()
++
++	const (
++		narInfoHash = "0123456789abcdfghijklmnpqrsvwxyz"
++		// The narinfo NarHash — a valid 52-char nix32 hash. ncps derives its
++		// storage key from this when the URL is opaque.
++		narHash    = "188g68hrjilbsjifcj70k8729zqhm9sl1q336vg5wxwzw0qp0sk4"
++		fileHash   = "1xqqdh1yn5sz3d6wcz3qz3azm5mbypwq6mv8g2dal1v042h0sprf"
++		fileSize   = 50308
++		opaqueURL  = "nar/d0c36585-67ac-4e1e-8747-3af0cbc09b90.nar.zst"
++		opaquePath = "/" + opaqueURL
++	)
++
++	narInfoText := fmt.Sprintf(`StorePath: /nix/store/%s-opaque-1.0
++URL: %s
++Compression: zstd
++FileHash: sha256:%s
++FileSize: %d
++NarHash: sha256:%s
++NarSize: 226560
++References: %s-opaque-1.0
++Sig: cache.nixos.org-1:eGSj5WPpZRjwzx7eWpCyZdNsFHjhtGTZF8T4FccYXjHNkTOZoGPfplgFP1w5bEST0/FtfV7f3AmQUVEv1NAEDg==
++`, narInfoHash, opaqueURL, fileHash, fileSize, narHash, narInfoHash)
++
++	narBody := testhelper.MustRandString(fileSize)
++
++	ts := testdata.NewTestServer(t, 40)
++	t.Cleanup(ts.Close)
++
++	ts.AddMaybeHandler(func(w http.ResponseWriter, r *http.Request) bool {
++		switch r.URL.Path {
++		case "/" + narInfoHash + ".narinfo":
++			_, _ = w.Write([]byte(narInfoText))
++
++			return true
++		case opaquePath:
++			w.Header().Set("Content-Length", strconv.Itoa(len(narBody)))
++			_, _ = w.Write([]byte(narBody))
++
++			return true
++		}
++
++		return false
++	})
++
++	c, dbClient, localStore, _, rebind, cleanup := setupSQLiteFactory(t)
++	t.Cleanup(cleanup)
++
++	// Register the upstream WITHOUT public keys so the crafted (unsigned-for-our-key)
++	// narinfo is accepted; the bug under test is in URL parsing, not signatures.
++	uc, err := upstream.New(newContext(), testhelper.MustParseURL(t, ts.URL), &upstream.Options{})
++	require.NoError(t, err)
++
++	c.AddUpstreamCaches(newContext(), uc)
++	c.SetRecordAgeIgnoreTouch(0)
++
++	<-c.GetHealthChecker().Trigger()
++
++	ni, err := c.GetNarInfo(context.Background(), narInfoHash)
++	require.NoError(t, err, "opaque upstream URL must not fail with 500")
++
++	// ncps re-serves the NAR under its own hash-named URL keyed off the NarHash.
++	wantURL := "nar/" + narHash + ".nar.zst"
++	assert.Equal(t, wantURL, ni.URL, "served narinfo URL should be ncps's own hash-named URL")
++
++	// The opaque upstream path is persisted so the NAR can be re-fetched later.
++	var upstreamURL sql.NullString
++
++	err = dbClient.DB().QueryRowContext(context.Background(),
++		rebind("SELECT upstream_url FROM narinfos WHERE hash = ?"), narInfoHash).
++		Scan(&upstreamURL)
++	require.NoError(t, err)
++	assert.True(t, upstreamURL.Valid, "upstream_url should be persisted")
++	assert.Equal(t, opaqueURL, upstreamURL.String)
++
++	// The NAR is fetched from the opaque upstream path and served back under the
++	// hash-named URL.
++	narURL, err := nar.ParseURL(ni.URL)
++	require.NoError(t, err)
++
++	_, size, rc, err := c.GetNar(context.Background(), narURL)
++	require.NoError(t, err, "the NAR should be fetchable via the opaque upstream path")
++
++	defer rc.Close()
++
++	got, err := io.ReadAll(rc)
++	require.NoError(t, err)
++	assert.Equal(t, int64(len(narBody)), size)
++	assert.Equal(t, []byte(narBody), got)
++
++	// Evict the local NAR bytes (keeping the DB records) and confirm a subsequent
++	// request re-fetches it from upstream via the persisted opaque path. The
++	// upstream only serves the NAR at the opaque path, so this fails unless the
++	// opaque path was restored from upstream_url.
++	require.NoError(t, localStore.DeleteNar(context.Background(), narURL))
++	require.False(t, c.HasNarInStore(context.Background(), narURL))
++
++	_, _, rc2, err := c.GetNar(context.Background(), narURL)
++	require.NoError(t, err, "evicted NAR must be re-fetchable via the persisted opaque upstream path")
++
++	defer rc2.Close()
++
++	// The re-fetch streams from upstream (size is reported as unknown/-1), so we
++	// assert on the bytes themselves rather than the reported size.
++	got2, err := io.ReadAll(rc2)
++	require.NoError(t, err)
++	assert.Equal(t, []byte(narBody), got2)
++}
++
+ func testGetNarInfo(factory cacheFactory) func(*testing.T) {
+ 	return func(t *testing.T) {
+ 		ts := testdata.NewTestServer(t, 40)
+diff --git a/pkg/nar/url.go b/pkg/nar/url.go
+index a89dbe8..5e9ee04 100644
+--- a/pkg/nar/url.go
++++ b/pkg/nar/url.go
+@@ -19,6 +19,13 @@ type URL struct {
+ 	Compression     CompressionType
+ 	Query           url.Values
+ 	TransparentZstd bool
++
++	// opaquePath holds the original upstream path (e.g. "nar/<uuid>.nar.zst")
++	// when the narinfo URL is not hash-named and therefore cannot be
++	// reconstructed from Hash. It is used exclusively for the upstream GET;
++	// the Hash field still drives ncps's local storage key. It is empty for
++	// conventional hash-named URLs. See ParseUpstreamURL.
++	opaquePath string
+ }
+ 
+ // ParseURL parses a nar URL (as present in narinfo) and returns its components.
+@@ -26,8 +33,68 @@ type URL struct {
+ // The hash must match HashPattern. This implementation is flexible about the
+ // directory structure - only the filename matters, not the "nar/" prefix.
+ func ParseURL(u string) (URL, error) {
++	_, hash, ct, query, err := parseURLParts(u)
++	if err != nil {
++		return URL{}, err
++	}
++
++	// Validate that the hash matches HashPattern.
++	if err := ValidateHash(hash); err != nil {
++		return URL{}, err
++	}
++
++	return URL{
++		Hash:        hash,
++		Compression: ct,
++		Query:       query,
++	}, nil
++}
++
++// ParseUpstreamURL parses a nar URL taken from an upstream narinfo. For
++// conventional hash-named URLs it is identical to ParseURL. For opaque URLs —
++// where the filename before ".nar" is not a valid Nix hash, as served by
++// cachix (e.g. "nar/<uuidv4>.nar.zst") — it preserves the original path for the
++// upstream GET and uses fallbackHash (the narinfo's NarHash) as ncps's internal
++// storage key. fallbackHash must be a valid hash; otherwise ErrInvalidHash is
++// returned.
++//
++// The Nix binary-cache protocol treats the narinfo URL field as an opaque path
++// relative to the cache root, so a pull-through proxy must tolerate non
++// hash-named URLs rather than reject them.
++func ParseUpstreamURL(u, fallbackHash string) (URL, error) {
++	pathPart, hash, ct, query, err := parseURLParts(u)
++	if err != nil {
++		return URL{}, err
++	}
++
++	// Fast path: a conventional hash-named URL behaves exactly like ParseURL.
++	if ValidateHash(hash) == nil {
++		return URL{
++			Hash:        hash,
++			Compression: ct,
++			Query:       query,
++		}, nil
++	}
++
++	// Opaque URL: the storage key must come from the narinfo's NarHash.
++	if err := ValidateHash(fallbackHash); err != nil {
++		return URL{}, fmt.Errorf("opaque nar URL %q needs a valid fallback hash: %w", u, err)
++	}
++
++	return URL{
++		Hash:        fallbackHash,
++		Compression: ct,
++		Query:       query,
++		opaquePath:  pathPart,
++	}, nil
++}
++
++// parseURLParts splits a nar URL into its path, hash, compression and query
++// components without validating the hash. ParseURL and ParseUpstreamURL share
++// this and apply their own hash policy.
++func parseURLParts(u string) (pathPart, hash string, ct CompressionType, query url.Values, err error) {
+ 	if u == "" {
+-		return URL{}, ErrInvalidURL
++		return "", "", "", nil, ErrInvalidURL
+ 	}
+ 
+ 	// Separate the query string from the path
+@@ -36,7 +103,7 @@ func ParseURL(u string) (URL, error) {
+ 	// Get the filename (last component of the path)
+ 	filename := filepath.Base(pathPart)
+ 	if filename == "" || filename == "." {
+-		return URL{}, ErrInvalidURL
++		return "", "", "", nil, ErrInvalidURL
+ 	}
+ 
+ 	// The filename must contain ".nar" followed by optional compression extension
+@@ -44,12 +111,7 @@ func ParseURL(u string) (URL, error) {
+ 	// Everything before .nar is the hash, everything after is optional compression
+ 	hash, afterNar, found := strings.Cut(filename, ".nar")
+ 	if !found || hash == "" {
+-		return URL{}, ErrInvalidURL
+-	}
+-
+-	// Validate that the hash matches HashPattern before processing further
+-	if err := ValidateHash(hash); err != nil {
+-		return URL{}, err
++		return "", "", "", nil, ErrInvalidURL
+ 	}
+ 
+ 	// Extract compression extension (e.g., ".bz2" -> "bz2", "" -> "")
+@@ -58,29 +120,44 @@ func ParseURL(u string) (URL, error) {
+ 	if afterNar != "" {
+ 		// afterNar should start with a dot
+ 		if !strings.HasPrefix(afterNar, ".") {
+-			return URL{}, ErrInvalidURL
++			return "", "", "", nil, ErrInvalidURL
+ 		}
+ 
+ 		compression = afterNar[1:] // remove leading dot
+ 	}
+ 
+ 	// Determine compression type
+-	ct, err := CompressionTypeFromExtension(compression)
++	ct, err = CompressionTypeFromExtension(compression)
+ 	if err != nil {
+-		return URL{}, fmt.Errorf("error computing the compression type: %w", err)
++		return "", "", "", nil, fmt.Errorf("error computing the compression type: %w", err)
+ 	}
+ 
+ 	// Parse the query string if present
+-	query, err := url.ParseQuery(rawQuery)
++	query, err = url.ParseQuery(rawQuery)
+ 	if err != nil {
+-		return URL{}, fmt.Errorf("error parsing the RawQuery as url.Values: %w", err)
++		return "", "", "", nil, fmt.Errorf("error parsing the RawQuery as url.Values: %w", err)
+ 	}
+ 
+-	return URL{
+-		Hash:        hash,
+-		Compression: ct,
+-		Query:       query,
+-	}, nil
++	return pathPart, hash, ct, query, nil
++}
++
++// IsOpaque reports whether the URL carries a preserved opaque upstream path
++// (i.e. the narinfo URL was not hash-named and the storage key was derived
++// from the narinfo NarHash instead).
++func (u URL) IsOpaque() bool { return u.opaquePath != "" }
++
++// OpaquePath returns the preserved opaque upstream path, or "" for a
++// conventional hash-named URL. Persist this so the NAR can be re-fetched from
++// upstream after the local copy is evicted.
++func (u URL) OpaquePath() string { return u.opaquePath }
++
++// WithOpaquePath returns a copy of the URL with the given opaque upstream path
++// attached, used when restoring a persisted opaque path so the upstream GET
++// targets the original path while local storage stays keyed off Hash.
++func (u URL) WithOpaquePath(path string) URL {
++	u.opaquePath = path
++
++	return u
+ }
+ 
+ // NewLogger returns a new logger with the right fields.
+@@ -124,6 +201,12 @@ func (u URL) ToFilePath() (string, error) {
+ }
+ 
+ func (u URL) pathWithCompression() string {
++	// Opaque upstream URLs cannot be reconstructed from Hash; the original
++	// path was preserved verbatim and is used for the upstream GET.
++	if u.opaquePath != "" {
++		return u.opaquePath
++	}
++
+ 	p := "nar/" + u.Hash + ".nar"
+ 
+ 	if e := u.Compression.ToFileExtension(); e != "" {
+diff --git a/pkg/nar/url_test.go b/pkg/nar/url_test.go
+index db401a2..35333d4 100644
+--- a/pkg/nar/url_test.go
++++ b/pkg/nar/url_test.go
+@@ -132,6 +132,104 @@ func TestParseURL(t *testing.T) {
+ 	}
+ }
+ 
++func TestParseUpstreamURL(t *testing.T) {
++	t.Parallel()
++
++	const fallback = "1mb5fxh7nzbx1b2q40bgzwjnjh8xqfap9mfnfqxlvvgvdyv8xwps"
++
++	t.Run("hash-named URL behaves exactly like ParseURL", func(t *testing.T) {
++		t.Parallel()
++
++		const u = "nar/1bn7c3bf5z32cdgylhbp9nzhh6ydib5ngsm6mdhsvf233g0nh1ac.nar.xz"
++
++		got, err := nar.ParseUpstreamURL(u, fallback)
++		require.NoError(t, err)
++
++		want, err := nar.ParseURL(u)
++		require.NoError(t, err)
++
++		assert.Equal(t, want, got)
++		assert.False(t, got.IsOpaque())
++		assert.Empty(t, got.OpaquePath())
++	})
++
++	t.Run("opaque (UUID) URL preserves upstream path and keys off the fallback hash", func(t *testing.T) {
++		t.Parallel()
++
++		const u = "nar/d0c36585-67ac-4e1e-8747-3af0cbc09b90.nar.zst"
++
++		got, err := nar.ParseUpstreamURL(u, fallback)
++		require.NoError(t, err)
++
++		// Storage key comes from the fallback (NarHash), not the URL.
++		fp, err := got.ToFilePath()
++		require.NoError(t, err)
++
++		wantFP, err := nar.FilePath(fallback, nar.CompressionTypeZstd.ToFileExtension())
++		require.NoError(t, err)
++		assert.Equal(t, wantFP, fp)
++
++		// Compression is still read from the URL.
++		assert.Equal(t, nar.CompressionTypeZstd, got.Compression)
++
++		// The opaque upstream path is preserved verbatim for the upstream GET.
++		assert.True(t, got.IsOpaque())
++		assert.Equal(t, "nar/d0c36585-67ac-4e1e-8747-3af0cbc09b90.nar.zst", got.OpaquePath())
++
++		base, err := url.Parse("http://example.com")
++		require.NoError(t, err)
++		assert.Equal(
++			t,
++			"http://example.com/nar/d0c36585-67ac-4e1e-8747-3af0cbc09b90.nar.zst",
++			got.JoinURL(base).String(),
++		)
++	})
++
++	t.Run("opaque URL with an invalid fallback hash errors", func(t *testing.T) {
++		t.Parallel()
++
++		_, err := nar.ParseUpstreamURL("nar/d0c36585-67ac-4e1e-8747-3af0cbc09b90.nar.zst", "not-a-hash")
++		assert.ErrorIs(t, err, nar.ErrInvalidHash)
++	})
++
++	t.Run("structurally invalid URL errors even with a valid fallback", func(t *testing.T) {
++		t.Parallel()
++
++		_, err := nar.ParseUpstreamURL("helloworld", fallback)
++		assert.ErrorIs(t, err, nar.ErrInvalidURL)
++	})
++}
++
++func TestWithOpaquePath(t *testing.T) {
++	t.Parallel()
++
++	base, err := url.Parse("http://example.com")
++	require.NoError(t, err)
++
++	const hash = "1mb5fxh7nzbx1b2q40bgzwjnjh8xqfap9mfnfqxlvvgvdyv8xwps"
++
++	u := nar.URL{Hash: hash, Compression: nar.CompressionTypeZstd}
++	assert.False(t, u.IsOpaque())
++
++	o := u.WithOpaquePath("nar/d0c36585-67ac-4e1e-8747-3af0cbc09b90.nar.zst")
++	assert.True(t, o.IsOpaque())
++	assert.Equal(
++		t,
++		"http://example.com/nar/d0c36585-67ac-4e1e-8747-3af0cbc09b90.nar.zst",
++		o.JoinURL(base).String(),
++	)
++
++	// Storage key is unchanged by attaching an opaque path.
++	fp, err := o.ToFilePath()
++	require.NoError(t, err)
++	wantFP, err := nar.FilePath(hash, nar.CompressionTypeZstd.ToFileExtension())
++	require.NoError(t, err)
++	assert.Equal(t, wantFP, fp)
++
++	// The original URL is not mutated.
++	assert.False(t, u.IsOpaque())
++}
++
+ func TestNormalize(t *testing.T) {
+ 	t.Parallel()
+ 
+-- 
+2.54.0
+
