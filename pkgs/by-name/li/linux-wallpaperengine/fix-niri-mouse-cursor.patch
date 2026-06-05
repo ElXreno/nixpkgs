@@ -1,0 +1,143 @@
+From f8008b76e821b90be0544dc37876f9716db8102d Mon Sep 17 00:00:00 2001
+From: ElXreno <elxreno@gmail.com>
+Date: Fri, 5 Jun 2026 20:47:43 +0300
+Subject: [PATCH] input: query niri for the cursor position on Wayland
+
+WaylandMouseInput only learned the cursor from wl_pointer events on its own
+background surface or from Hyprland's IPC socket. niri delivers no pointer
+events to background-layer surfaces and has no Hyprland socket, so the cursor
+was pinned to {0,0} and mouse-reactive wallpapers did nothing (#495).
+
+Add queryNiriCursorPosition(): when the Hyprland query fails, request the
+global pointer location from niri over $NIRI_SOCKET, reusing the existing
+global->viewport mapping. It needs niri's `niri msg pointer` IPC; if that is
+unavailable the reply does not parse and we fall back to {0,0} as before, so
+there is no regression on stock niri.
+
+Fixes #495
+---
+ .../Input/Drivers/WaylandMouseInput.cpp       | 76 ++++++++++++++++++-
+ .../Input/Drivers/WaylandMouseInput.h         |  3 +-
+ 2 files changed, 75 insertions(+), 4 deletions(-)
+
+diff --git a/src/WallpaperEngine/Input/Drivers/WaylandMouseInput.cpp b/src/WallpaperEngine/Input/Drivers/WaylandMouseInput.cpp
+index b27b7cf..b1735c4 100644
+--- a/src/WallpaperEngine/Input/Drivers/WaylandMouseInput.cpp
++++ b/src/WallpaperEngine/Input/Drivers/WaylandMouseInput.cpp
+@@ -28,12 +28,15 @@ void WaylandMouseInput::update () {
+     }
+ 
+     const auto now = std::chrono::steady_clock::now ();
+-    if (now - this->m_lastHyprlandQuery < std::chrono::milliseconds (16)) {
++    if (now - this->m_lastCursorQuery < std::chrono::milliseconds (16)) {
+ 	return;
+     }
+-    this->m_lastHyprlandQuery = now;
++    this->m_lastCursorQuery = now;
+ 
+-    const auto globalCursor = this->queryHyprlandCursorPosition ();
++    auto globalCursor = this->queryHyprlandCursorPosition ();
++    if (!globalCursor.has_value ()) {
++	globalCursor = this->queryNiriCursorPosition ();
++    }
+     if (!globalCursor.has_value ()) {
+ 	this->m_pos = { 0, 0 };
+ 	return;
+@@ -171,6 +174,73 @@ std::optional<glm::dvec2> WaylandMouseInput::queryHyprlandCursorPosition () cons
+     }
+ }
+ 
++std::optional<glm::dvec2> WaylandMouseInput::queryNiriCursorPosition () const {
++    const char* socketPath = std::getenv ("NIRI_SOCKET");
++    if (!socketPath) {
++	return std::nullopt;
++    }
++
++    int fd = socket (AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
++    if (fd < 0) {
++	return std::nullopt;
++    }
++
++    timeval timeout {};
++    timeout.tv_usec = 50000;
++    if (setsockopt (fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof (timeout)) != 0
++	|| setsockopt (fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof (timeout)) != 0) {
++	close (fd);
++	return std::nullopt;
++    }
++
++    sockaddr_un addr {};
++    addr.sun_family = AF_UNIX;
++    if (std::strlen (socketPath) >= sizeof (addr.sun_path)) {
++	close (fd);
++	return std::nullopt;
++    }
++    std::strncpy (addr.sun_path, socketPath, sizeof (addr.sun_path) - 1);
++
++    if (connect (fd, reinterpret_cast<sockaddr*> (&addr), sizeof (addr)) != 0) {
++	close (fd);
++	return std::nullopt;
++    }
++
++    // niri-ipc Request::Pointer is a unit variant, serialized as a JSON string.
++    constexpr const char* request = "\"Pointer\"\n";
++    if (send (fd, request, std::strlen (request), MSG_NOSIGNAL) < 0) {
++	close (fd);
++	return std::nullopt;
++    }
++    shutdown (fd, SHUT_WR);
++
++    std::string response;
++    char buffer[256];
++    ssize_t readBytes = 0;
++    while ((readBytes = recv (fd, buffer, sizeof (buffer), 0)) > 0) {
++	response.append (buffer, static_cast<std::size_t> (readBytes));
++	if (response.find ('\n') != std::string::npos) {
++	    break;
++	}
++    }
++    close (fd);
++
++    // Reply shape: {"Ok":{"Pointer":{"location":{"x":..,"y":..}}}}
++    static const std::regex xRegex (R"("x"\s*:\s*(-?\d+(?:\.\d+)?))");
++    static const std::regex yRegex (R"("y"\s*:\s*(-?\d+(?:\.\d+)?))");
++    std::smatch xMatch;
++    std::smatch yMatch;
++    if (!std::regex_search (response, xMatch, xRegex) || !std::regex_search (response, yMatch, yRegex)) {
++	return std::nullopt;
++    }
++
++    try {
++	return glm::dvec2 { std::stod (xMatch[1].str ()), std::stod (yMatch[1].str ()) };
++    } catch (const std::exception&) {
++	return std::nullopt;
++    }
++}
++
+ WallpaperEngine::Input::MouseClickStatus WaylandMouseInput::rightClick () const {
+     const auto* viewport = this->getActiveOutputViewport ();
+ 
+diff --git a/src/WallpaperEngine/Input/Drivers/WaylandMouseInput.h b/src/WallpaperEngine/Input/Drivers/WaylandMouseInput.h
+index 5574437..fb9cf35 100644
+--- a/src/WallpaperEngine/Input/Drivers/WaylandMouseInput.h
++++ b/src/WallpaperEngine/Input/Drivers/WaylandMouseInput.h
+@@ -46,6 +46,7 @@ public:
+ private:
+     [[nodiscard]] const Render::Drivers::Output::WaylandOutputViewport* getActiveOutputViewport () const;
+     [[nodiscard]] std::optional<glm::dvec2> queryHyprlandCursorPosition () const;
++    [[nodiscard]] std::optional<glm::dvec2> queryNiriCursorPosition () const;
+ 
+     /**
+      * Wayland: Driver
+@@ -53,7 +54,7 @@ private:
+     const WallpaperEngine::Render::Drivers::WaylandOpenGLDriver& m_waylandDriver;
+ 
+     glm::dvec2 m_pos = {};
+-    std::chrono::steady_clock::time_point m_lastHyprlandQuery = {};
++    std::chrono::steady_clock::time_point m_lastCursorQuery = {};
+ };
+ } // namespace WallpaperEngine::Input::Drivers
+ 
+-- 
+2.54.0
+
