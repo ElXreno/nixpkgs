@@ -706,13 +706,12 @@ in
 
       preStart = ''
         ${lib.optionalString (cfg.cache.databaseURLFile != null) ''
-          export DATABASE_URL="$(cat "$CREDENTIALS_DIRECTORY/databaseURL")"
+          export CACHE_DATABASE_URL="$(cat "$CREDENTIALS_DIRECTORY/databaseURL")"
         ''}
         ${lib.optionalString (cfg.cache.databaseURL != null) ''
-          export DATABASE_URL="${cfg.cache.databaseURL}"
+          export CACHE_DATABASE_URL="${cfg.cache.databaseURL}"
         ''}
-        echo ${cfg.package}/bin/dbmate-ncps up
-        ${cfg.package}/bin/dbmate-ncps up
+        ${lib.getExe cfg.package} migrate up
       '';
 
       serviceConfig = lib.mkMerge [
