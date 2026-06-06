@@ -118,6 +118,8 @@ stdenv.mkDerivation (finalAttrs: {
     "-DCMAKE_INSTALL_PREFIX=${placeholder "out"}/share/linux-wallpaperengine"
   ];
 
+  stripDebugList = [ "share/linux-wallpaperengine" ];
+
   postInstall = ''
     rm -rf $out/bin $out/lib $out/include
     chmod 755 $out/share/linux-wallpaperengine/linux-wallpaperengine
