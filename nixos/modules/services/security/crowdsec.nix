@@ -665,6 +665,17 @@ in
         cfg.settings.config.crowdsec_service.acquisition_dir
         "${config_paths.config_dir}/console"
         "${config_paths.config_dir}/scenarios"
+        # Every hub stage dir, owned by the crowdsec user so cscli
+        # (crowdsec-setup) can install hub items as the unprivileged crowdsec
+        # user. tmpfiles otherwise creates the ones holding generated symlinks
+        # root-owned. The parsers/postoverflows parents are left to tmpfiles
+        # (root): cscli only ever writes inside these stages, never the parent.
+        "${config_paths.config_dir}/parsers/s00-raw"
+        "${config_paths.config_dir}/parsers/s01-parse"
+        "${config_paths.config_dir}/parsers/s02-enrich"
+        "${config_paths.config_dir}/postoverflows/s00-enrich"
+        "${config_paths.config_dir}/postoverflows/s01-whitelist"
+        "${config_paths.config_dir}/contexts"
       ];
 
       setupScript = pkgs.writeShellApplication {
