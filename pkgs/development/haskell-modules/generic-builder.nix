@@ -85,6 +85,31 @@ let
     emscripten
     ;
 
+  # This is a script suitable for --test-wrapper of Setup.hs' test command
+  # (https://cabal.readthedocs.io/en/3.12/setup-commands.html#cmdoption-runhaskell-Setup.hs-test-test-wrapper).
+  # We use it to set some environment variables that the test suite may need,
+  # e.g. GHC_PACKAGE_PATH to invoke GHC(i) at runtime with build dependencies
+  # available. See the comment accompanying checkPhase below on how to customize
+  # this behavior. We need to use a wrapper script since Cabal forbids setting
+  # certain environment variables since they can alter GHC's behavior (e.g.
+  # GHC_PACKAGE_PATH) and cause failures. While building, Cabal will set
+  # GHC_ENVIRONMENT to make the packages picked at configure time available to
+  # GHC, but unfortunately not at test time. The test wrapper script will be
+  # executed after such environment checks, so we can take some liberties which
+  # is unproblematic since we know our synthetic package db matches what Cabal
+  # will see at configure time exactly. See also
+  # <https://github.com/haskell/cabal/issues/7792>.
+  testWrapperScript = buildPackages.writeShellScript "haskell-generic-builder-test-wrapper.sh" ''
+    set -eu
+
+    # We expect this to be either empty or set by checkPhase
+    if [[ -n "''${NIX_GHC_PACKAGE_PATH_FOR_TEST}" ]]; then
+      export GHC_PACKAGE_PATH="''${NIX_GHC_PACKAGE_PATH_FOR_TEST}"
+    fi
+
+    exec "$@"
+  '';
+
 in
 
 {
@@ -592,31 +617,6 @@ let
     shouldCopy = shouldAdd && !doInstallIntermediates;
     shouldSymlink = shouldAdd && doInstallIntermediates;
   };
-
-  # This is a script suitable for --test-wrapper of Setup.hs' test command
-  # (https://cabal.readthedocs.io/en/3.12/setup-commands.html#cmdoption-runhaskell-Setup.hs-test-test-wrapper).
-  # We use it to set some environment variables that the test suite may need,
-  # e.g. GHC_PACKAGE_PATH to invoke GHC(i) at runtime with build dependencies
-  # available. See the comment accompanying checkPhase below on how to customize
-  # this behavior. We need to use a wrapper script since Cabal forbids setting
-  # certain environment variables since they can alter GHC's behavior (e.g.
-  # GHC_PACKAGE_PATH) and cause failures. While building, Cabal will set
-  # GHC_ENVIRONMENT to make the packages picked at configure time available to
-  # GHC, but unfortunately not at test time. The test wrapper script will be
-  # executed after such environment checks, so we can take some liberties which
-  # is unproblematic since we know our synthetic package db matches what Cabal
-  # will see at configure time exactly. See also
-  # <https://github.com/haskell/cabal/issues/7792>.
-  testWrapperScript = buildPackages.writeShellScript "haskell-generic-builder-test-wrapper.sh" ''
-    set -eu
-
-    # We expect this to be either empty or set by checkPhase
-    if [[ -n "''${NIX_GHC_PACKAGE_PATH_FOR_TEST}" ]]; then
-      export GHC_PACKAGE_PATH="''${NIX_GHC_PACKAGE_PATH_FOR_TEST}"
-    fi
-
-    exec "$@"
-  '';
 
   testTargetsString =
     lib.warnIf (testTarget != "")
